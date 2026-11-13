@@ -6,9 +6,9 @@ cd "${0:A:h}"
 APP="build.noindex/Call Copilot.app"
 [[ -e build.noindex ]] && /usr/bin/trash build.noindex
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-swiftc -O -swift-version 5 -target arm64-apple-macos26.0 Sources/*.swift -o "$APP/Contents/MacOS/CallCopilot"
+swiftc -O -swift-version 5 -target arm64-apple-macos26.0 Sources/*.swift Shared/*.swift -o "$APP/Contents/MacOS/CallCopilot"
 cp Resources/Info.plist "$APP/Contents/"
-cp Resources/prompt.txt Resources/default-settings.json "$APP/Contents/Resources/"
+cp Shared/prompt.txt Shared/default-settings.json "$APP/Contents/Resources/"
 # Hardened runtime: blocks injected libraries and debugger attachment, so other code can't borrow the app's
 # microphone and system-audio permissions from inside it.
 codesign --force --options runtime --entitlements Resources/entitlements.plist --sign - "$APP"

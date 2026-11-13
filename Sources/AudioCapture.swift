@@ -2,11 +2,6 @@ import AVFoundation
 import CoreAudio
 import Foundation
 
-struct CaptureError: Error, CustomStringConvertible {
-    let description: String
-    init(_ d: String) { description = d }
-}
-
 /// Retries a failed restart after 0.5, 1, 2 and 5 s, then reports the failure.
 private func retrying(_ what: String, attempt: Int = 0, _ body: @escaping () throws -> Void,
                       failed: @escaping (String) -> Void) {

@@ -130,3 +130,24 @@ final class SourceTranscriber {
         if nonZero { _lastNonZero = now }
     }
 }
+
+extension SourceTranscriber {
+    /// Transcribes an audio file instead of live audio (tests and demos). `realtime` feeds it at its own pace, as if
+    /// live; otherwise as fast as the analyzer takes it.
+    func feed(file: URL, realtime: Bool) async throws {
+        let f = try AVAudioFile(forReading: file)
+        let chunk: AVAudioFrameCount = 4800
+        let start = Date()
+        var fed: Double = 0
+        while f.framePosition < f.length, let buf = AVAudioPCMBuffer(pcmFormat: f.processingFormat, frameCapacity: chunk) {
+            try f.read(into: buf, frameCount: min(chunk, AVAudioFrameCount(f.length - f.framePosition)))
+            if buf.frameLength == 0 { break }
+            append(buf)
+            if realtime {
+                fed += Double(buf.frameLength) / f.processingFormat.sampleRate
+                let ahead = fed - Date().timeIntervalSince(start)
+                if ahead > 0 { try await Task.sleep(nanoseconds: UInt64(ahead * 1e9)) }
+            }
+        }
+    }
+}

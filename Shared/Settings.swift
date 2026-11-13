@@ -1,5 +1,11 @@
 import Foundation
 
+/// An error with a plain-language description, shown to the user as is.
+struct CaptureError: Error, CustomStringConvertible {
+    let description: String
+    init(_ d: String) { description = d }
+}
+
 /// Something to surface during calls without being asked, in plain language.
 struct Watcher: Codable {
     var name: String
@@ -16,16 +22,16 @@ struct Watcher: Codable {
     var usesWeb: Bool { web ?? false }
 }
 
-/// ~/Library/Application Support/Call Copilot/settings.json. Read at the start of every call, so edits apply from
-/// the next call without a rebuild.
+/// The user's watchers and options, in settings.json (Config.settingsURL). Read at the start of every call, so edits
+/// apply from the next call without a rebuild. The Mac and iPhone apps share this format.
 struct Settings: Codable {
     var model: String?
     var effort: String?
     /// A sentence about you and your calls, so cards fit your context.
     var aboutMe: String?
     var watchers: [Watcher]?
-    /// Sites a web-enabled watcher may open pages on. Each entry covers the site and its subdomains; "ac.uk" covers
-    /// every UK university. Searching isn't limited by this list; opening pages is.
+    /// Sites a web-enabled watcher may open pages on. Each entry covers the site and its subdomains; "gov.uk" covers
+    /// every UK government site. Searching isn't limited by this list; opening pages is.
     var trustedSites: [String]?
 
     var activeWatchers: [Watcher] { (watchers ?? []).filter(\.isOn) }
@@ -96,6 +102,11 @@ struct Settings: Codable {
     /// --allowedTools entries for opening pages: each trusted site and its subdomains (a bare entry doesn't cover www).
     var fetchRules: [String] { trustedHosts.flatMap { ["WebFetch(domain:\($0))", "WebFetch(domain:*.\($0))"] } }
 
+    /// The Messages API's allowed_domains for opening pages (each covers its subdomains). The API takes only full site
+    /// names, so an entry without a dot, such as "gov", can't be passed on: see `sitesTheAPIRejects`.
+    var fetchDomains: [String] { trustedHosts.filter { $0.contains(".") } }
+    var sitesTheAPIRejects: [String] { trustedHosts.filter { !$0.contains(".") } }
+
     func isTrusted(_ url: URL) -> Bool {
         guard let host = url.host?.lowercased() else { return false }
         return trustedHosts.contains { host == $0 || host.hasSuffix("." + $0) }
@@ -114,7 +125,7 @@ struct Reference {
     static let maxChars = 150_000
     static let maxBytes = 5_000_000
     /// A web list is fetched at most once a day, so its server learns when you use the app on a given day, not when
-    /// each call starts. Kept in ~/Library/Caches/Call Copilot.
+    /// each call starts.
     static let cacheFor: TimeInterval = 24 * 3600
 
     static func load(for watcher: Watcher) async throws -> (Reference, String?) {
@@ -161,7 +172,8 @@ struct Reference {
 
     private static func fetch(_ source: String) async throws -> (Data, String?) {
         guard let url = URL(string: source) else { throw CaptureError("bad address") }
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches/Call Copilot")
+        // ~/Library/Caches/Call Copilot on the Mac; the app's own caches folder on iPhone.
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Call Copilot")
         let key = source.utf8.reduce(UInt64(14695981039346656037)) { ($0 ^ UInt64($1)) &* 1099511628211 } // FNV-1a
         let cached = dir.appendingPathComponent(String(key, radix: 16) + ".ref")
         let age = ((try? FileManager.default.attributesOfItem(atPath: cached.path))?[.modificationDate] as? Date)
@@ -193,5 +205,50 @@ struct Reference {
         return re.matches(in: text, range: NSRange(location: 0, length: ns.length)).map {
             ns.substring(with: $0.range).trimmingCharacters(in: CharacterSet(charactersIn: ".,;:"))
         }
+    }
+}
+
+/// Loads every watcher's reference list (in the app; Claude never fetches them). Lists not loaded within 20 s are
+/// skipped, so one slow list can't hold up the call. Returns the lists that loaded and a note for each problem.
+enum ReferenceLoader {
+    static func loadAll(_ watchers: [Watcher], deadline: TimeInterval = 20) async -> ([Reference], [String]) {
+        let wanted = watchers.filter { $0.reference != nil }
+        guard !wanted.isEmpty else { return ([], []) }
+        var loaded: [Reference] = []
+        var notes: [String] = []
+        await withTaskGroup(of: (String, Result<(Reference, String?), Error>)?.self) { group in
+            for w in wanted {
+                group.addTask {
+                    do { return (w.name, .success(try await Reference.load(for: w))) }
+                    catch { return (w.name, .failure(error)) }
+                }
+            }
+            group.addTask { try? await Task.sleep(nanoseconds: UInt64(deadline * 1_000_000_000)); return nil }
+            var pendingNames = Set(wanted.map(\.name))
+            for await result in group {
+                guard let (name, outcome) = result else { break } // deadline reached
+                pendingNames.remove(name)
+                switch outcome {
+                case .success(let (ref, note)):
+                    loaded.append(ref)
+                    if let note { notes.append("\(name)'s reference list: \(note).") }
+                case .failure(let e):
+                    notes.append("\(name)'s reference list didn't load (\(e)), so it runs without it.")
+                }
+                if pendingNames.isEmpty { break }
+            }
+            for name in pendingNames { notes.append("\(name)'s reference list took too long, so it runs without it.") }
+            group.cancelAll()
+        }
+        return (loaded, notes)
+    }
+
+    /// The REFERENCE part of a call's first message.
+    static func message(_ refs: [Reference]) -> String? {
+        guard !refs.isEmpty else { return nil }
+        return refs.map { r in
+            "REFERENCE for the \(r.watcher) watcher (from \(r.source))"
+                + (r.items.isEmpty ? ", without ids, so give ref null for it" : "") + ":\n\(r.text)"
+        }.joined(separator: "\n\n")
     }
 }

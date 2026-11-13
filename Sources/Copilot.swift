@@ -1,18 +1,6 @@
 import AVFoundation
 import Foundation
 
-struct Card: Identifiable {
-    let id = UUID()
-    let watcher: String
-    /// Position of the watcher in the settings, for its colour.
-    let watcherIndex: Int
-    let title: String
-    let body: String
-    let quote: String
-    /// Only links that came from a reference list or this call's search and page results.
-    let links: [URL]
-}
-
 /// Runs one call: capture -> on-device transcript -> Claude -> cards. All state changes happen on the main queue.
 /// The transcript lives only in memory and is dropped when the call ends. Every call starts fresh, so back-to-back
 /// calls never share context.
@@ -67,9 +55,8 @@ final class Copilot: ObservableObject {
     // Claude
     private var settings = Settings()
     private var watchers: [Watcher] = []
-    private var references: [String: Reference] = [:]
+    private var rules = CardRules(watchers: []) // the call's watchers, reference lists and allowed links (Cards.swift)
     private var referenceMessage: String? // the REFERENCE message, once every list has loaded (nil if there are none)
-    private var allowedLinks = Set<String>() // URLs a card may link to
     private var toolInputs: [String: (name: String, input: [String: Any])] = [:]
     private var session: ClaudeSession?
     private var sessionReady = false
@@ -84,7 +71,6 @@ final class Copilot: ObservableObject {
     private var turnDeadline = Date.distantFuture
     private var restarts = 0
     private var lastSend = Date.distantPast
-    private var shownCards = Set<String>()
     private var timer: Timer?
 
     // MARK: call detection
@@ -139,7 +125,6 @@ final class Copilot: ObservableObject {
         lastSpeech = Date()
         recap = []
         cards = []; answer = nil
-        shownCards = []
         lastLine = nil; recentLines = []; turnError = nil; captureNote = nil; setupNote = nil
         sessionLines = []
         inFlightLines = []
@@ -149,8 +134,9 @@ final class Copilot: ObservableObject {
         settings = loaded
         watchers = loaded.activeWatchers
         setupNote = settingsError
-        references = [:]; referenceMessage = nil; referencesReady = false
-        allowedLinks = []; toolInputs = [:]
+        rules = CardRules(watchers: watchers)
+        referenceMessage = nil; referencesReady = false
+        toolInputs = [:]
         themIsAllAudio = testFiles.isEmpty && processes.isEmpty
         lastSend = Date()
         updateWatchStatus()
@@ -225,7 +211,7 @@ final class Copilot: ObservableObject {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for (t, file) in sources {
                     group.addTask {
-                        try await Self.feed(file: file, into: t, realtime: realtime)
+                        try await t.feed(file: file, realtime: realtime)
                         await t.finish()
                     }
                 }
@@ -297,29 +283,12 @@ final class Copilot: ObservableObject {
         }
     }
 
-    private static func feed(file: URL, into t: SourceTranscriber, realtime: Bool) async throws {
-        let f = try AVAudioFile(forReading: file)
-        let chunk: AVAudioFrameCount = 4800
-        let start = Date()
-        var fed: Double = 0
-        while f.framePosition < f.length, let buf = AVAudioPCMBuffer(pcmFormat: f.processingFormat, frameCapacity: chunk) {
-            try f.read(into: buf, frameCount: min(chunk, AVAudioFrameCount(f.length - f.framePosition)))
-            if buf.frameLength == 0 { break }
-            t.append(buf)
-            if realtime {
-                fed += Double(buf.frameLength) / f.processingFormat.sampleRate
-                let ahead = fed - Date().timeIntervalSince(start)
-                if ahead > 0 { try await Task.sleep(nanoseconds: UInt64(ahead * 1e9)) }
-            }
-        }
-    }
-
     // MARK: watchers and references
 
     private func updateWatchStatus() {
         watchStatus = watchers.map { w -> String in
             guard w.reference != nil else { return w.name }
-            if let r = references[w.name] { return r.items.isEmpty ? w.name : "\(w.name) (\(r.items.count))" }
+            if let r = rules.references[w.name] { return r.items.isEmpty ? w.name : "\(w.name) (\(r.items.count))" }
             return referencesReady ? "\(w.name) (no list)" : "\(w.name) (loading)"
         }.joined(separator: " · ")
         if watchers.isEmpty { watchStatus = "No watchers: asks only" }
@@ -328,50 +297,22 @@ final class Copilot: ObservableObject {
     /// Loads every watcher's reference list in the app (Claude never fetches them), then builds the first message.
     /// Lists not loaded within 20 s are skipped, so one slow list can't hold up the call.
     private func loadReferences(gen: Int) {
-        let wanted = watchers.filter { $0.reference != nil }
+        let wanted = watchers
         Task { [weak self] in
-            var loaded: [Reference] = []
-            var notes: [String] = []
-            await withTaskGroup(of: (String, Result<(Reference, String?), Error>)?.self) { group in
-                for w in wanted {
-                    group.addTask {
-                        do { return (w.name, .success(try await Reference.load(for: w))) }
-                        catch { return (w.name, .failure(error)) }
-                    }
-                }
-                group.addTask { try? await Task.sleep(nanoseconds: 20_000_000_000); return nil } // the deadline
-                var pendingNames = Set(wanted.map(\.name))
-                for await result in group {
-                    guard let (name, outcome) = result else { break } // deadline reached
-                    pendingNames.remove(name)
-                    switch outcome {
-                    case .success(let (ref, note)):
-                        loaded.append(ref)
-                        if let note { notes.append("\(name)'s reference list: \(note).") }
-                    case .failure(let e):
-                        notes.append("\(name)'s reference list didn't load (\(e)), so it runs without it.")
-                    }
-                    if pendingNames.isEmpty { break }
-                }
-                for name in pendingNames { notes.append("\(name)'s reference list took too long, so it runs without it.") }
-                group.cancelAll()
-            }
-            let refs = loaded, messages = notes
+            let (refs, messages) = await ReferenceLoader.loadAll(wanted)
             await MainActor.run {
                 guard let self, self.generation == gen else { return }
                 for r in refs {
-                    self.references[r.watcher] = r
-                    self.allowedLinks.formUnion(r.links)
+                    self.rules.add(r)
                     log("reference: \(r.watcher): \(r.items.count) items, \(r.text.count) chars")
                 }
                 if !messages.isEmpty {
                     messages.forEach { log("reference: \($0)") }
                     self.setupNote = ([self.setupNote].compactMap { $0 } + messages).joined(separator: " ")
                 }
-                self.referenceMessage = refs.isEmpty ? nil : refs.map { r in
-                    "REFERENCE for the \(r.watcher) watcher (from \(r.source))"
-                        + (r.items.isEmpty ? ", without ids, so give ref null for it" : "") + ":\n\(r.text)"
-                }.joined(separator: "\n\n") + "\n\nThat is all the reference material for this call. Reply with an empty card list."
+                self.referenceMessage = ReferenceLoader.message(refs).map {
+                    $0 + "\n\nThat is all the reference material for this call. Reply with an empty card list."
+                }
                 self.referencesReady = true
                 self.updateWatchStatus()
                 self.tick()
@@ -380,13 +321,14 @@ final class Copilot: ObservableObject {
     }
 
     private func systemPrompt() -> String? {
-        guard let url = Bundle.main.url(forResource: "prompt", withExtension: "txt"),
-              let template = try? String(contentsOf: url, encoding: .utf8) else { return nil }
-        let about = (settings.aboutMe ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        return template
-            .replacingOccurrences(of: "{{ABOUT}}", with: about.isEmpty ? "" : "About the user: \(about)\n")
-            .replacingOccurrences(of: "{{WATCHERS}}", with: watchers.isEmpty ? "(none: answer asks only)" : settings.watcherText)
+        guard let template = SystemPrompt.bundledTemplate() else { return nil }
+        return SystemPrompt.make(template: template, settings: settings, watchers: watchers, setting: Self.promptSetting)
     }
+
+    /// Where the transcript comes from, for the prompt.
+    static let promptSetting = "You assist the user during a live call. You receive the call transcript in chunks as it "
+        + "happens. [Me] is the user's microphone; [Them] is everyone else. If the user is on speakers, [Me] may also "
+        + "pick up the other side."
 
     /// Links a card may use from this call's web results: the addresses in a search result's link list (chosen by the
     /// search engine, not the model), and pages on the trusted sites that were actually opened. Nothing is taken from
@@ -398,11 +340,11 @@ final class Copilot: ObservableObject {
         if let parts = content as? [[String: Any]] { text = parts.compactMap { $0["text"] as? String }.joined(separator: "\n") }
         switch use.name {
         case "WebSearch":
-            allowedLinks.formUnion(Self.searchResultLinks(text))
+            rules.allowLinks(Self.searchResultLinks(text))
         case "WebFetch":
             guard let s = use.input["url"] as? String, let url = URL(string: s), settings.isTrusted(url),
                   !text.hasPrefix("The server returned HTTP"), !text.contains("REDIRECT DETECTED") else { return }
-            allowedLinks.insert(s)
+            rules.allowLinks([s])
         default:
             break
         }
@@ -427,18 +369,6 @@ final class Copilot: ObservableObject {
         guard let end, let data = String(text[open...end]).data(using: .utf8),
               let list = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
         return list.compactMap { $0["url"] as? String }
-    }
-
-    private func allowedLink(_ s: String) -> URL? {
-        func norm(_ x: String) -> String {
-            var y = x.trimmingCharacters(in: CharacterSet(charactersIn: " .,;:"))
-            while y.hasSuffix("/") { y.removeLast() }
-            return y
-        }
-        let n = norm(s)
-        guard n.hasPrefix("https://") || n.hasPrefix("http://"),
-              allowedLinks.contains(where: { norm($0) == n }) else { return nil }
-        return URL(string: n)
     }
 
     // MARK: Claude session
@@ -609,87 +539,16 @@ final class Copilot: ObservableObject {
         if hadAsk && queuedAsk == nil { asking = false }
         turnError = nil
         if echo { print("REPLY " + text.replacingOccurrences(of: "\n", with: " ")) }
-        guard let reply = Self.firstJSONObject(in: text) else {
+        guard let reply = rules.read(text) else {
             log("claude: reply had no JSON object")
             if hadAsk { answer = text } // a plain-text answer is still an answer
             tick(); return
         }
-        var added: [Card] = []
-        for case let c as [String: Any] in reply["cards"] as? [Any] ?? [] {
-            guard let name = c["watcher"] as? String,
-                  let wi = watchers.firstIndex(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) else { continue }
-            var title = (c["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            var links = (c["links"] as? [Any] ?? []).compactMap { $0 as? String }
-            let key: String
-            var ref = (c["ref"] as? String) ?? (c["ref"] as? NSNumber)?.stringValue
-            if let r = ref, r.isEmpty || r.lowercased() == "null" { ref = nil }
-            if let ref {
-                // A card about a reference item must name a real one in its own watcher's list; its name and link
-                // come from the list itself.
-                guard let item = references[watchers[wi].name]?.items[ref] else {
-                    log("claude: dropped a card with an unknown ref"); continue
-                }
-                title = item.name
-                if let u = item.url { links.insert(u, at: 0) }
-                key = "\(wi):ref:" + ref
-            } else {
-                key = watchers[wi].name.lowercased() + ":" + title.lowercased().filter { $0.isLetter || $0.isNumber }
-            }
-            guard !title.isEmpty, shownCards.insert(key).inserted else { continue }
-            var unique: [String] = []
-            for l in links where !unique.contains(l) { unique.append(l) }
-            var urls: [URL] = []
-            for l in unique { if let u = allowedLink(l), !urls.contains(u) { urls.append(u) } }
-            let dropped = unique.count - urls.count
-            if dropped > 0 { log("claude: dropped \(dropped) link(s) not from a reference list or this call's results") }
-            added.append(Card(watcher: watchers[wi].name, watcherIndex: wi, title: title,
-                              body: (c["body"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
-                              quote: c["quote"] as? String ?? "", links: Array(urls.prefix(3))))
-            log("card: \(watchers[wi].name)\(ref != nil ? " (reference item)" : "")")
-        }
-        if !added.isEmpty {
-            cards.insert(contentsOf: added.reversed(), at: 0)
+        if !reply.cards.isEmpty {
+            cards.insert(contentsOf: reply.cards.reversed(), at: 0)
             onCardsAdded?()
         }
-        if hadAsk {
-            switch reply["answer"] {
-            case let s as String: answer = s
-            case nil, is NSNull: answer = "(No answer came back.)"
-            case let other?:
-                answer = (try? JSONSerialization.data(withJSONObject: other, options: [.prettyPrinted]))
-                    .flatMap { String(data: $0, encoding: .utf8) } ?? "\(other)"
-            }
-        }
+        if hadAsk { answer = reply.answer ?? "(No answer came back.)" }
         tick()
-    }
-
-    /// The first balanced `{…}` in the text that parses as a JSON object; braces inside strings don't count.
-    static func firstJSONObject(in text: String) -> [String: Any]? {
-        let chars = Array(text.utf8)
-        var start = chars.firstIndex(of: UInt8(ascii: "{"))
-        while let s = start {
-            var depth = 0, inString = false, escaped = false
-            var i = s
-            scan: while i < chars.count {
-                let c = chars[i]
-                if inString {
-                    if escaped { escaped = false } else if c == UInt8(ascii: "\\") { escaped = true }
-                    else if c == UInt8(ascii: "\"") { inString = false }
-                } else if c == UInt8(ascii: "\"") { inString = true }
-                else if c == UInt8(ascii: "{") { depth += 1 }
-                else if c == UInt8(ascii: "}") {
-                    depth -= 1
-                    if depth == 0 {
-                        if let obj = try? JSONSerialization.jsonObject(with: Data(chars[s...i])) as? [String: Any] {
-                            return obj
-                        }
-                        break scan
-                    }
-                }
-                i += 1
-            }
-            start = s + 1 < chars.count ? chars[(s + 1)...].firstIndex(of: UInt8(ascii: "{")) : nil
-        }
-        return nil
     }
 }
