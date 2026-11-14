@@ -57,6 +57,7 @@ final class MessagesSession {
     static let fallbackModels: Set<String> = ["claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5",
                                               "claude-sonnet-5-5"]
     /// Model families whose web tools can filter results in a sandbox before they reach the context (fewer tokens).
+    /// Model families whose web tool versions are the newer ones (sent with direct calls only, see webTools).
     static let filteringPrefixes = ["claude-fable-5", "claude-mythos-5", "claude-opus-5", "claude-opus-4-6",
                                     "claude-opus-4-7", "claude-opus-4-8", "claude-sonnet-5", "claude-sonnet-4-6"]
 
@@ -70,6 +71,9 @@ final class MessagesSession {
     private(set) var usage = Usage()
     /// Prompt size of the last request (input, cache reads and cache writes), to know when to start afresh.
     private(set) var lastPromptTokens = 0
+    /// A request timed out, was cancelled or lost its connection after it was sent. The server may still have run
+    /// (and billed) it without the usage reaching us, so the cost estimate is then a lower bound.
+    private(set) var costIsLowerBound = false
 
     init(apiKey: String, settings: Settings, system: String) {
         self.apiKey = apiKey
@@ -86,20 +90,25 @@ final class MessagesSession {
     static func webTools(settings: Settings) -> [[String: Any]] {
         guard settings.usesWeb else { return [] }
         let filtering = filteringPrefixes.contains { settings.modelName.hasPrefix($0) }
+        // Newer tool versions run searches from inside a code sandbox by default; "direct" keeps it to plain tool
+        // calls, so no code runs anywhere and max_uses holds across a paused turn.
         var tools: [[String: Any]] = [[
             "type": filtering ? "web_search_20260318" : "web_search_20250305",
             "name": "web_search",
             "max_uses": 2,
         ]]
+        if filtering { tools[0]["allowed_callers"] = ["direct"] }
         let domains = settings.fetchDomains
         if !domains.isEmpty {
-            tools.append([
+            var fetch: [String: Any] = [
                 "type": filtering ? "web_fetch_20260318" : "web_fetch_20250910",
                 "name": "web_fetch",
                 "max_uses": 2,
                 "allowed_domains": domains,
                 "max_content_tokens": 20_000, // a page stays in the conversation, so keep each one bounded
-            ])
+            ]
+            if filtering { fetch["allowed_callers"] = ["direct"] }
+            tools.append(fetch)
         }
         return tools
     }
@@ -116,9 +125,9 @@ final class MessagesSession {
         for _ in 0..<4 { // a turn the server paused is continued, at most 3 times
             let response = try await post(convo, container: container, timeout: timeout)
             container = (response["container"] as? [String: Any])?["id"] as? String ?? container
-            let content = Self.forHistory(response["content"] as? [[String: Any]] ?? [])
-            add(usage: response["usage"] as? [String: Any], servedBy: response["model"] as? String)
             let stop = response["stop_reason"] as? String ?? ""
+            let content = Self.forHistory(response["content"] as? [[String: Any]] ?? [], final: stop != "pause_turn")
+            add(usage: response["usage"] as? [String: Any], servedBy: response["model"] as? String)
             if stop == "refusal" {
                 log("claude: turn declined (\((response["stop_details"] as? [String: Any])?["category"] as? String ?? "no category"))")
                 throw Failure.refused
@@ -136,9 +145,9 @@ final class MessagesSession {
     private func post(_ convo: [[String: Any]], container: String?, timeout: TimeInterval) async throws -> [String: Any] {
         var body: [String: Any] = [
             "model": model,
-            "max_tokens": 16_000,
+            "max_tokens": 4_096, // replies are short JSON; a cap keeps a steered reply from running long
             "system": system,
-            "messages": convo,
+            "messages": Self.withCacheBreakpoint(convo),
             "output_config": ["effort": effort],
             "cache_control": ["type": "ephemeral"], // caches the whole conversation so far, each turn
         ]
@@ -157,7 +166,13 @@ final class MessagesSession {
 
         let data: Data, response: URLResponse
         do { (data, response) = try await URLSession.shared.data(for: request) }
-        catch { throw Failure.retry((error as? URLError).map { Self.describe($0) } ?? "\(error)") }
+        catch {
+            if let e = error as? URLError, [.timedOut, .cancelled, .networkConnectionLost].contains(e.code) {
+                costIsLowerBound = true
+            }
+            if error is CancellationError { costIsLowerBound = true }
+            throw Failure.retry((error as? URLError).map { Self.describe($0) } ?? "\(error)")
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         let message = ((json?["error"] as? [String: Any])?["message"] as? String).map { String($0.prefix(200)) }
@@ -218,7 +233,7 @@ final class MessagesSession {
     ///   thinking, connector text, client tool calls, and server tool calls without a result;
     /// - an empty reply (Claude occasionally ends a turn with nothing) becomes an empty card list, because an empty
     ///   assistant message isn't valid in the middle of a conversation.
-    static func forHistory(_ content: [[String: Any]]) -> [[String: Any]] {
+    static func forHistory(_ content: [[String: Any]], final: Bool = true) -> [[String: Any]] {
         var out = content
         if let lastFallback = content.lastIndex(where: { $0["type"] as? String == "fallback" }) {
             let resultIDs = Set(content.compactMap { $0["tool_use_id"] as? String })
@@ -231,7 +246,20 @@ final class MessagesSession {
                 }
             }
         }
-        if out.isEmpty { out = [["type": "text", "text": #"{"cards":[],"answer":null}"#]] }
+        if out.isEmpty && final { out = [["type": "text", "text": #"{"cards":[],"answer":null}"#]] }
+        return out
+    }
+
+    /// The top-level cache_control caches the conversation up to the newest message, but a cache hit is found only by
+    /// looking back about 20 content blocks from it. A turn with several searches and cited text can be longer than
+    /// that, so the previous user message (where the last cache entry ended) gets its own breakpoint too.
+    static func withCacheBreakpoint(_ convo: [[String: Any]]) -> [[String: Any]] {
+        var out = convo
+        let userTurns = out.indices.filter { out[$0]["role"] as? String == "user" }
+        guard userTurns.count >= 2, let i = userTurns.dropLast().last,
+              var blocks = out[i]["content"] as? [[String: Any]], !blocks.isEmpty else { return out }
+        blocks[blocks.count - 1]["cache_control"] = ["type": "ephemeral"]
+        out[i]["content"] = blocks
         return out
     }
 

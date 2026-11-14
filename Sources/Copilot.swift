@@ -134,7 +134,11 @@ final class Copilot: ObservableObject {
         settings = loaded
         watchers = loaded.activeWatchers
         setupNote = settingsError
-        rules = CardRules(watchers: watchers)
+        rules = CardRules(watchers: watchers, trusted: loaded.isTrusted)
+        if !loaded.rejectedSites.isEmpty {
+            setupNote = [setupNote, "Left out of trusted sites: " + loaded.rejectedSites.joined(separator: ", ") + "."]
+                .compactMap { $0 }.joined(separator: " ")
+        }
         referenceMessage = nil; referencesReady = false
         toolInputs = [:]
         themIsAllAudio = testFiles.isEmpty && processes.isEmpty
@@ -267,7 +271,7 @@ final class Copilot: ObservableObject {
         t.onFinal = { [weak self] text in
             DispatchQueue.main.async {
                 guard let self, self.generation == gen else { return }
-                let line = "[\(label)] \(text)"
+                let line = "[\(label)] \(PromptText.neutral(text))" // speech can't pose as a typed question
                 if self.echo { print("HEARD " + line) }
                 self.pending.append(line)
                 self.lastLine = line

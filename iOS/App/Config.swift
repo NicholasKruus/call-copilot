@@ -15,8 +15,13 @@ enum Config {
         + "as it happens, from the user's iPhone microphone: everyone in the room (or a call on a nearby speaker), with "
         + "no speaker labels."
 
-    /// Test switches work only alongside a --test-* launch argument, so nothing else can change what the app does.
+    /// Test switches work only alongside a --test-* launch argument, and only in development (Debug) builds:
+    /// `iOS/build.sh phone` installs a Release build, in which they don't exist.
+    #if DEBUG
     static let isTestRun = ProcessInfo.processInfo.arguments.contains { $0.hasPrefix("--test-") }
+    #else
+    static let isTestRun = false
+    #endif
 
     static func testValue(_ flag: String, offset: Int = 1) -> String? {
         let a = ProcessInfo.processInfo.arguments

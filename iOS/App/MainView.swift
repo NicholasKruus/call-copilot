@@ -88,8 +88,9 @@ struct MainView: View {
                     }
                 }
                 if let cost = copilot.cost {
-                    Text(String(format: "≈ $%.2f", cost)).font(K.mono(10.5)).foregroundStyle(K.muted)
-                        .accessibilityLabel(String(format: "About %.2f dollars so far", cost))
+                    Text(String(format: "%@ $%.2f", copilot.costIsLowerBound ? "≥" : "≈", cost))
+                        .font(K.mono(10.5)).foregroundStyle(K.muted)
+                        .accessibilityLabel(String(format: "%@ %.2f dollars so far", copilot.costIsLowerBound ? "At least" : "About", cost))
                 }
                 Spacer(minLength: 8)
                 if !copilot.watchStatus.isEmpty {
@@ -178,6 +179,7 @@ struct MainView: View {
 struct CardRow: View {
     let card: Card
     @Environment(\.openURL) private var openURL
+    @State private var confirming: URL?
 
     private var color: Color { Palette.watcher(card.watcherIndex) }
 
@@ -208,17 +210,30 @@ struct CardRow: View {
         .contentShape(Rectangle())
         .contextMenu {
             Button("Copy") { UIPasteboard.general.string = "\(card.title)\n\(card.body)\n" + card.links.map(\.absoluteString).joined(separator: "\n") }
-            if let u = card.links.first { Button("Open \(u.host ?? "link")") { openURL(u) } }
+            if let u = card.links.first { Button("Open \(u.host ?? "link")") { open(u) } }
         }
+        .confirmationDialog("Open \(confirming?.host ?? "this link")?", isPresented: Binding(
+            get: { confirming != nil }, set: { if !$0 { confirming = nil } }), titleVisibility: .visible) {
+            Button("Open") { if let u = confirming { openURL(u) }; confirming = nil }
+        } message: {
+            Text("This link came from a web search, not from your trusted sites or a reference list.")
+        }
+    }
+
+    /// Links from an untrusted search result are confirmed first, because anyone can get a page into search results.
+    private func open(_ url: URL) {
+        if card.offList.contains(url) { confirming = url } else { openURL(url) }
     }
 
     @ViewBuilder private var links: some View {
         ForEach(card.links, id: \.self) { url in
-            Link(destination: url) {
+            Button { open(url) } label: {
                 Text(((url.host ?? "link").replacingOccurrences(of: "www.", with: "") + " ↗").uppercased())
                     .font(K.mono(11)).tracking(0.4).foregroundStyle(K.accentInk).underline()
                     .frame(minHeight: 28)
             }
+            .buttonStyle(.plain)
+            .accessibilityHint(card.offList.contains(url) ? "From a web search; asks before opening" : "Opens the source")
         }
     }
 }

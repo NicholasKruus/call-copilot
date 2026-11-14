@@ -3,6 +3,7 @@
 #
 #   iOS/build.sh sim     build for the Simulator, install it on a booted (or the first available) iPhone simulator, open it
 #   iOS/build.sh phone   build for your iPhone (connected by cable or on the same Wi-Fi) and install it
+#   iOS/build.sh phone --debug   the same, as a development build with the --test-* launch switches
 #
 # For a phone, first put your team and a bundle ID prefix in iOS/Config/Signing.local.xcconfig (see Signing.xcconfig),
 # sign in to Xcode with your Apple account (Xcode → Settings → Accounts), and turn on Developer Mode on the iPhone.
@@ -32,9 +33,11 @@ case $target in
     echo "installed on simulator $udid"
     ;;
   phone)
-    xcodebuild -project CallCopilot.xcodeproj -scheme CallCopilot -configuration Debug \
+    config=Release
+    [[ "${2:-}" == "--debug" ]] && config=Debug
+    xcodebuild -project CallCopilot.xcodeproj -scheme CallCopilot -configuration $config \
       -destination 'generic/platform=iOS' -derivedDataPath $OUT -allowProvisioningUpdates -quiet build
-    app=$OUT/Build/Products/Debug-iphoneos/CallCopilot.app
+    app=$OUT/Build/Products/$config-iphoneos/CallCopilot.app
     json=$(mktemp)
     xcrun devicectl list devices --json-output $json >/dev/null 2>&1 || true
     device=$(/usr/bin/python3 -c 'import json,sys

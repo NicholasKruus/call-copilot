@@ -18,7 +18,7 @@ final class CallBrain {
         static let maxRetries = 3
         /// Once a request's prompt is this large, the next turn starts a fresh conversation with a recap of what was
         /// said. Old search results and pages drop out, and each turn costs less to re-read.
-        static let freshConversationAt = 300_000
+        static let freshConversationAt = 150_000
     }
 
     var onCards: (@MainActor ([Card]) -> Void)?
@@ -28,7 +28,8 @@ final class CallBrain {
     var onNote: (@MainActor (String?) -> Void)?
     /// A problem that ends the session (a refused key, a request the API keeps rejecting).
     var onFatal: (@MainActor (String) -> Void)?
-    var onUsage: (@MainActor (Double?) -> Void)?
+    /// The session's estimated cost so far, and whether it's only a lower bound (see MessagesSession.costIsLowerBound).
+    var onUsage: (@MainActor (Double?, Bool) -> Void)?
     var onReferences: (@MainActor ([String: Reference], [String]) -> Void)?
 
     let settings: Settings
@@ -45,7 +46,9 @@ final class CallBrain {
     /// Lines Claude has answered, for a recap when a fresh conversation starts.
     private var answered: [String] = []
     private var needsRecap = false
-    private var queuedAsk: String?
+    /// Typed questions waiting to go, oldest first; one goes per turn.
+    private var asks: [String] = []
+    private var queuedAsk: String? { asks.first }
     private(set) var busy = false
     private var inFlight: Task<Void, Never>?
     private var lastSend = Date.distantPast
@@ -55,11 +58,12 @@ final class CallBrain {
     private var rejectedInARow = 0
     /// Cost of the conversations before the current one.
     private var earlierCost: Double? = 0
+    private var earlierLowerBound = false
 
     init(settings: Settings, apiKey: String, template: String, setting: String) {
         self.settings = settings
         self.watchers = settings.activeWatchers
-        self.rules = CardRules(watchers: settings.activeWatchers)
+        self.rules = CardRules(watchers: settings.activeWatchers, trusted: settings.isTrusted)
         self.apiKey = apiKey
         self.system = SystemPrompt.make(template: template, settings: settings, watchers: settings.activeWatchers,
                                         setting: setting)
@@ -89,16 +93,17 @@ final class CallBrain {
     func stop() {
         stopped = true
         inFlight?.cancel(); inFlight = nil
-        pending = []; answered = []; queuedAsk = nil
+        pending = []; answered = []; asks = []
         session = nil
     }
 
-    func hear(_ line: String) { pending.append(line) }
+    /// A transcript line. Marker words in it are defused, so speech can't pose as a typed question.
+    func hear(_ line: String) { pending.append(PromptText.neutral(line)) }
 
     func ask(_ question: String) {
         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return }
-        queuedAsk = q
+        asks.append(q)
         onAsking?(true)
         tick()
     }
@@ -127,9 +132,8 @@ final class CallBrain {
                 + answered.joined(separator: "\n"))
         }
         let lines = pending
-        let ask = queuedAsk
+        let ask = asks.isEmpty ? nil : asks.removeFirst()
         pending = []
-        queuedAsk = nil
         if !lines.isEmpty { parts.append("TRANSCRIPT\n" + lines.joined(separator: "\n")) }
         if let ask { parts.append("ASK: " + ask) }
         busy = true
@@ -154,7 +158,6 @@ final class CallBrain {
         needsRecap = false
         answered += lines
         onNote?(nil)
-        report()
         if turn.truncated { log("claude: reply was cut off") }
         rules.allowLinks(turn.links) // before reading the cards, which cite this turn's results
         if let reply = rules.read(turn.text) {
@@ -165,6 +168,8 @@ final class CallBrain {
             if ask != nil { onAnswer?(turn.text.isEmpty ? "(No answer came back.)" : turn.text) }
         }
         if ask != nil && queuedAsk == nil { onAsking?(false) }
+        report() // after the cards, so a turn that reaches the budget still shows what it found
+        guard !stopped else { return }
         if session.lastPromptTokens > Timing.freshConversationAt { startFresh("the conversation got long") }
         tick()
     }
@@ -178,7 +183,7 @@ final class CallBrain {
         log("claude: turn failed: \(failure)")
         func requeue() {
             pending = lines + pending
-            if let ask { queuedAsk = queuedAsk ?? ask }
+            if let ask { asks.insert(ask, at: 0) }
         }
         switch failure {
         case .auth:
@@ -218,14 +223,23 @@ final class CallBrain {
 
     private func startFresh(_ reason: String) {
         log("claude: starting a fresh conversation: \(reason)")
-        if let s = session { earlierCost = earlierCost.flatMap { e in s.usage.cost.map { e + $0 } } }
+        if let s = session {
+            earlierCost = earlierCost.flatMap { e in s.usage.cost.map { e + $0 } }
+            earlierLowerBound = earlierLowerBound || s.costIsLowerBound
+        }
         session = nil
         needsRecap = true
     }
 
     /// The session's running cost: earlier conversations plus the current one.
+    /// Reports the running cost, and ends the session once it reaches the budget in Settings.
     private func report() {
         let current = session.map { $0.usage.cost } ?? 0
-        onUsage?(earlierCost.flatMap { e in current.map { e + $0 } })
+        let total = earlierCost.flatMap { e in current.map { e + $0 } }
+        let lowerBound = earlierLowerBound || session?.costIsLowerBound == true
+        onUsage?(total, lowerBound)
+        if let total, total >= settings.budget {
+            onFatal?(String(format: "Stopped at your $%.2f limit for one session (Settings → Claude).", settings.budget))
+        }
     }
 }

@@ -101,13 +101,15 @@ speaker. It can't hear a call taken on the iPhone itself: iOS doesn't let one ap
   subscription login, and Claude Code doesn't run on iPhone. Create a key at
   [platform.claude.com](https://platform.claude.com/settings/keys) and paste it into Settings. It's kept in the
   iPhone's Keychain (this device only) and is checked with Anthropic before it's saved. You pay per use; the running
-  cost shows while you listen.
+  cost shows while you listen (as a minimum, "≥", if a request may have been billed without its usage coming back),
+  and listening stops when a session reaches your limit in Settings ($10 unless you change it).
 - **Start it** with **Listen**, or say "Start Call Copilot" to Siri, or assign the "Start listening" shortcut to the
   Action Button. It keeps listening with the screen locked. The newest card shows on the Lock Screen and in the Dynamic
   Island, with a **Stop** button. It stops by itself after 10 minutes without speech, or after 4 hours.
-- **Web access** uses Anthropic's own web search and page fetch. Pages open only on your trusted sites (the API
-  enforces the list, subdomains included), and only at addresses already in the conversation, so Claude can't make one
-  up. There's no other tool: it can't run, change or send anything.
+- **Web access** uses Anthropic's own web search and page fetch, as plain tool calls (no code runs, on the phone or
+  at Anthropic). Pages open only on your trusted sites (the API enforces the list, subdomains included), and only at
+  addresses already in the conversation, so Claude can't make one up. There's no other tool: it can't run, change or
+  send anything. A link from a search result on a site that isn't on your list asks before it opens.
 - **Privacy:** audio stays on the phone. The transcript, your questions, your settings and your reference lists go to
   Anthropic under your API account's data settings. Nothing from a meeting is saved after listening stops. Cards on
   the Lock Screen can be read by anyone who sees your phone.
@@ -125,6 +127,8 @@ You need a Mac with Xcode 26 or later, and an iPhone on iOS 26 or later.
    corporate socket filter can stop that connection; turn them off while installing.)
 4. Run `iOS/build.sh phone` (or press Run in Xcode). On the iPhone, trust your developer account under
    **Settings → General → VPN & Device Management**, open Call Copilot and add your API key.
+   `iOS/build.sh phone` installs a Release build; `iOS/build.sh phone --debug` installs one with the `--test-*`
+   launch switches below.
 
 **Cost** on the iPhone, measured with the two example watchers on Opus 5.5 at low effort: the first update of a session
 about $0.10 (it caches the Automations list), an update that searched the web about $0.07, and other updates about a
@@ -161,9 +165,14 @@ cent. Sonnet and Haiku cost less.
   speaker or web page would have to talk Claude into it, and the site would have to be one you trust, which is why the
   default list has research publishers, statistics offices and government sites, but not places anyone can publish,
   such as university home pages. Turn `web` off on all watchers if that matters for your calls.
-- **Links come from sources, not from Claude.** A card links only to an address from a reference list, from a search
-  result, or to a trusted page Claude actually opened; never to an address Claude wrote, a page's text or an error. A
-  search can return any site, so the card shows each link's site name: check it before relying on it.
+- **Links come from sources, not from Claude.** A card links only to an https address from a reference list, from a
+  search result, or to a trusted page Claude actually opened; never to an address Claude wrote, a page's text or an
+  error, and never one with a user name, a port, or a look-alike name in another script. A search can return any site,
+  so the card shows each link's site name (and the iPhone asks before opening one that isn't on your list).
+- **Speech can't pose as you.** Marker words such as "ASK:" in the transcript or a reference list are defused, so only
+  a question you typed counts as one. Each reply shows at most three cards, of limited length.
+- **Trusted sites must be specific.** Entries that would cover sites anyone can register (such as "com" or "co.uk"),
+  or that aren't a plain site name, are left out, and the panel says so when listening starts.
 - **Only Anthropic's Claude Code runs.** Anything the app launches inherits its microphone and system-audio access, so
   it checks that `claude` is signed by Anthropic before starting it. The app uses Apple's hardened runtime, so other
   code can't load into it.
@@ -193,8 +202,8 @@ Checks that need no microphone (each needs its `--test-*` argument):
     "build.noindex/Call Copilot.app/Contents/MacOS/CallCopilot" --test-demo me.wav them.wav --ask-at 68 "Which is the quickest win?"
 
 The code both apps share (settings, card and link rules, the prompt, transcription) is in `Shared/`. The iPhone app is
-in `iOS/`; `iOS/Harness/run.sh --selftest` checks its card and link rules on a Mac, and `iOS/build.sh sim` runs it in the
-Simulator. On the iPhone, `--test-file <audio in the app's Documents>` and `--test-listen` (passed with
+in `iOS/`; on a Mac, `iOS/Harness/run.sh --selftest` checks the card, link and site rules, `--stubtest` checks the
+conversation logic against a fake API server, and `iOS/build.sh sim` runs the app in the Simulator. On the iPhone, `--test-file <audio in the app's Documents>` and `--test-listen` (passed with
 `xcrun devicectl device process launch … --console`) print the cards.
 
 ## License

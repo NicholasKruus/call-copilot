@@ -31,6 +31,8 @@ final class PhoneCopilot: ObservableObject {
     @Published private(set) var turnNote: String?
     /// Estimated cost of this session at list prices; nil for a model without known prices.
     @Published private(set) var cost: Double?
+    /// A request may have been billed without its usage coming back, so `cost` is a minimum.
+    @Published private(set) var costIsLowerBound = false
     @Published private(set) var startedAt: Date?
     @Published private(set) var hasKey = false
 
@@ -64,6 +66,7 @@ final class PhoneCopilot: ObservableObject {
         let gen = generation
         log("start")
         cards = []; answer = nil; asking = false; lastLine = nil; notes = []; turnNote = nil; cost = nil
+        costIsLowerBound = false
         startedAt = Date()
         lastSpeech = Date()
         phase = .starting
@@ -72,6 +75,9 @@ final class PhoneCopilot: ObservableObject {
         if let settingsNote { notes.append(settingsNote) }
         guard let key = apiKey() else { return fail("Add your Anthropic API key in Settings first.") }
         guard let template = SystemPrompt.bundledTemplate() else { return fail("The app is missing its prompt. Rebuild it.") }
+        if !settings.rejectedSites.isEmpty {
+            notes.append("Left out of trusted sites: " + settings.rejectedSites.joined(separator: ", ") + ".")
+        }
         watchers = settings.activeWatchers
         let brain = CallBrain(settings: settings, apiKey: key, template: template, setting: Config.promptSetting)
         wire(brain, gen: gen)
@@ -230,9 +236,10 @@ final class PhoneCopilot: ObservableObject {
             guard let self, self.generation == gen else { return }
             self.fail(message)
         }
-        brain.onUsage = { [weak self] c in
+        brain.onUsage = { [weak self] c, lowerBound in
             guard let self, self.generation == gen else { return }
             self.cost = c
+            self.costIsLowerBound = lowerBound
         }
         brain.onReferences = { [weak self] refs, notes in
             guard let self, self.generation == gen else { return }
@@ -255,6 +262,7 @@ final class PhoneCopilot: ObservableObject {
         if let s = startedAt, now.timeIntervalSince(s) > Config.maxSession {
             return stop("Stopped after \(Int(Config.maxSession / 3600)) hours")
         }
+        activity.keepFresh()
         brain?.tick()
     }
 
@@ -283,9 +291,11 @@ final class PhoneCopilot: ObservableObject {
 
     private func activityState() -> CopilotActivityAttributes.ContentState {
         let top = cards.first
-        return .init(status: phase == .starting ? "Starting" : statusText, listening: phase == .listening,
-                     cardCount: cards.count, watcher: top?.watcher, colorIndex: top?.watcherIndex ?? 0,
-                     title: top?.title, body: top?.body)
+        // Short enough to stay well under ActivityKit's 4 KB limit for the whole state.
+        func clip(_ s: String?, _ n: Int) -> String? { s.map { $0.count <= n ? $0 : String($0.prefix(n - 1)) + "…" } }
+        return .init(status: clip(phase == .starting ? "Starting" : statusText, 80)!, listening: phase == .listening,
+                     cardCount: cards.count, watcher: clip(top?.watcher, 40), colorIndex: top?.watcherIndex ?? 0,
+                     title: clip(top?.title, 100), body: clip(top?.body, 240))
     }
 
     private func updateActivity() { activity.update(activityState()) }

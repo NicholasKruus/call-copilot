@@ -16,6 +16,7 @@ struct SettingsView: View {
 
     private static let models = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
     private static let efforts = ["low", "medium", "high"]
+    private static let budgets: [Double] = [2, 5, 10, 20, 50]
 
     var body: some View {
         NavigationStack {
@@ -119,8 +120,14 @@ struct SettingsView: View {
             Picker("Effort", selection: optional(\.effort, default: "low")) {
                 ForEach(Self.efforts, id: \.self) { Text($0.capitalized).tag($0) }
             }
+            Picker("Stop a session at", selection: Binding(get: { settings.budget },
+                                                           set: { settings.sessionBudget = $0 })) {
+                ForEach(Self.budgets + (Self.budgets.contains(settings.budget) ? [] : [settings.budget]), id: \.self) {
+                    Text(String(format: "$%.0f", $0)).tag($0)
+                }
+            }
         } header: { Text("Claude") } footer: {
-            Text("Opus is the most careful. Sonnet costs about half as much and Haiku far less, but they may miss more. Higher effort thinks longer and costs more.")
+            Text("Opus is the most careful. Sonnet costs about half as much and Haiku far less, but they may miss more. Higher effort thinks longer and costs more. Listening stops when a session's estimated cost reaches the limit.")
         }
     }
 

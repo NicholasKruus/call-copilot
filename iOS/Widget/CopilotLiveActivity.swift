@@ -13,12 +13,12 @@ struct CopilotWidgets: WidgetBundle {
 struct CopilotLiveActivity: Widget {
     var body: some WidgetConfiguration {
         ActivityConfiguration(for: CopilotActivityAttributes.self) { context in
-            LockScreenView(state: context.state, startedAt: context.attributes.startedAt)
+            LockScreenView(state: Self.shown(context), startedAt: context.attributes.startedAt)
                 .activityBackgroundTint(Color(.systemBackground))
         } dynamicIsland: { context in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
-                    StatusLabel(state: context.state).padding(.leading, 4)
+                    StatusLabel(state: Self.shown(context)).padding(.leading, 4)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
                     Text("\(context.state.cardCount) cards").font(.caption2.monospaced()).foregroundStyle(.secondary)
@@ -32,15 +32,24 @@ struct CopilotLiveActivity: Widget {
                     .padding(.horizontal, 4)
                 }
             } compactLeading: {
-                Image(systemName: context.state.listening ? "waveform" : "pause.fill")
-                    .foregroundStyle(context.state.listening ? Palette.green : Palette.amber)
+                Image(systemName: Self.shown(context).listening ? "waveform" : "pause.fill")
+                    .foregroundStyle(Self.shown(context).listening ? Palette.green : Palette.amber)
             } compactTrailing: {
                 Text("\(context.state.cardCount)").font(.caption.monospacedDigit().bold())
                     .foregroundStyle(context.state.cardCount > 0 ? Palette.watcher(context.state.colorIndex) : .secondary)
             } minimal: {
-                Image(systemName: "waveform").foregroundStyle(context.state.listening ? Palette.green : Palette.amber)
+                Image(systemName: "waveform").foregroundStyle(Self.shown(context).listening ? Palette.green : Palette.amber)
             }
         }
+    }
+
+    /// The state to draw: once the app has stopped refreshing it (killed or suspended), it says so.
+    static func shown(_ context: ActivityViewContext<CopilotActivityAttributes>) -> CopilotActivityAttributes.ContentState {
+        guard context.isStale else { return context.state }
+        var s = context.state
+        s.status = "Not running: open Call Copilot"
+        s.listening = false
+        return s
     }
 }
 

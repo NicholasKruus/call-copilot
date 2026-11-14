@@ -10,6 +10,9 @@ struct Card: Identifiable {
     let quote: String
     /// Only links that came from a reference list or this call's search and page results.
     let links: [URL]
+    /// Links from a web search on a site that isn't trusted and isn't in a reference list. The iPhone asks before
+    /// opening these, because anyone can get a page into search results.
+    var offList: Set<URL> = []
 }
 
 /// What one call's cards may contain: its watchers, their reference lists, and the links the call has earned. Both
@@ -19,18 +22,29 @@ struct Card: Identifiable {
 ///   from the list, not from Claude;
 /// - a link must have come from a reference list or from this call's search and page results, never from text
 ///   Claude wrote, so a planted instruction can't put an address of its choosing on a card;
-/// - a card already shown this call isn't shown again.
+/// - a card already shown this call isn't shown again;
+/// - a reply has at most a few cards, each of bounded length, so an injected reply can't flood the screen or put a
+///   long message on the Lock Screen.
 final class CardRules {
+    static let maxCardsPerReply = 3
+    static let maxTitle = 100, maxBody = 400, maxQuote = 150, maxAnswer = 2_500
+
     let watchers: [Watcher]
     private(set) var references: [String: Reference] = [:]
+    private let trusted: (URL) -> Bool
     private var allowed = Set<String>() // normalized
+    private var fromReferences = Set<String>() // normalized
     private var shown = Set<String>()
 
-    init(watchers: [Watcher]) { self.watchers = watchers }
+    init(watchers: [Watcher], trusted: @escaping (URL) -> Bool = { _ in false }) {
+        self.watchers = watchers
+        self.trusted = trusted
+    }
 
     func add(_ reference: Reference) {
         references[reference.watcher] = reference
         allowLinks(reference.links)
+        for l in reference.links { fromReferences.insert(Self.normalize(l)) }
     }
 
     func allowLinks<S: Sequence>(_ links: S) where S.Element == String {
@@ -43,10 +57,22 @@ final class CardRules {
         return y
     }
 
+    /// A card link: earned this call, https, a plain host (no user name, password or port), and either an ASCII host
+    /// or a trusted one, so a look-alike name in another script can't pass for a familiar site.
     func allowedLink(_ s: String) -> URL? {
         let n = Self.normalize(s)
-        guard n.hasPrefix("https://") || n.hasPrefix("http://"), allowed.contains(n) else { return nil }
-        return URL(string: n)
+        guard n.lowercased().hasPrefix("https://"), allowed.contains(n), let u = URL(string: n),
+              let host = u.host, !host.isEmpty, u.user == nil, u.password == nil, u.port == nil else { return nil }
+        if host.contains("xn--") || !host.allSatisfy({ $0.isASCII }) { return trusted(u) ? u : nil }
+        return u
+    }
+
+    private func isOffList(_ u: URL) -> Bool {
+        !trusted(u) && !fromReferences.contains(Self.normalize(u.absoluteString))
+    }
+
+    private static func clip(_ s: String, _ n: Int) -> String {
+        s.count <= n ? s : String(s.prefix(n - 1)) + "…"
     }
 
     struct Reply {
@@ -84,9 +110,12 @@ final class CardRules {
             for l in unique { if let u = allowedLink(l), !urls.contains(u) { urls.append(u) } }
             let dropped = unique.count - urls.count
             if dropped > 0 { log("claude: dropped \(dropped) link(s) not from a reference list or this call's results") }
-            out.cards.append(Card(watcher: watchers[wi].name, watcherIndex: wi, title: title,
-                                  body: (c["body"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
-                                  quote: c["quote"] as? String ?? "", links: Array(urls.prefix(3))))
+            guard out.cards.count < Self.maxCardsPerReply else { log("claude: dropped cards over the per-reply limit"); break }
+            let kept = Array(urls.prefix(3))
+            out.cards.append(Card(watcher: watchers[wi].name, watcherIndex: wi, title: Self.clip(title, Self.maxTitle),
+                                  body: Self.clip((c["body"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines), Self.maxBody),
+                                  quote: Self.clip(c["quote"] as? String ?? "", Self.maxQuote), links: kept,
+                                  offList: Set(kept.filter(isOffList))))
             log("card: \(watchers[wi].name)\(ref != nil ? " (reference item)" : "")")
         }
         switch reply["answer"] {
@@ -96,6 +125,7 @@ final class CardRules {
             out.answer = (try? JSONSerialization.data(withJSONObject: other, options: [.prettyPrinted]))
                 .flatMap { String(data: $0, encoding: .utf8) } ?? "\(other)"
         }
+        out.answer = out.answer.map { Self.clip($0, Self.maxAnswer) }
         return out
     }
 }
@@ -146,5 +176,17 @@ enum SystemPrompt {
     static func bundledTemplate() -> String? {
         guard let url = Bundle.main.url(forResource: "prompt", withExtension: "txt") else { return nil }
         return try? String(contentsOf: url, encoding: .utf8)
+    }
+}
+
+/// Text that goes into Claude's messages from other sources (speech, reference lists). The words the protocol uses as
+/// markers are defused, so a speaker or a list can't pose as a typed question or as a new part of the message.
+enum PromptText {
+    static func neutral(_ s: String) -> String {
+        var t = s
+        for (marker, plain) in [("ASK:", "ask -"), ("TRANSCRIPT", "transcript"), ("REFERENCE", "reference")] {
+            t = t.replacingOccurrences(of: marker, with: plain, options: marker.hasSuffix(":") ? [.caseInsensitive] : [])
+        }
+        return t
     }
 }

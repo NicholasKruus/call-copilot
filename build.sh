@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "${0:A:h}"
 APP="build.noindex/Call Copilot.app"
-[[ -e build.noindex ]] && /usr/bin/trash build.noindex
+[[ -e "$APP" ]] && /usr/bin/trash "$APP" # only the Mac app: build.noindex also holds the iPhone builds
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 -target arm64-apple-macos26.0 Sources/*.swift Shared/*.swift -o "$APP/Contents/MacOS/CallCopilot"
 cp Resources/Info.plist "$APP/Contents/"

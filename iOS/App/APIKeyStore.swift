@@ -42,8 +42,8 @@ enum APIKeyStore {
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             let message = (json?["error"] as? [String: Any])?["message"] as? String ?? "HTTP \(status)"
             guard status == 401 else { return message }
-            // What was pasted, without revealing the key: real keys start "sk-ant-api03-" and are about 108 characters.
-            let shape = "\(key.count) characters, starting “\(key.prefix(12))…”"
+            // What was pasted, without showing any of it: real keys start "sk-ant-" and are about 108 characters.
+            let shape = "\(key.count) characters, \(key.hasPrefix("sk-ant-") ? "starting like a key" : "not starting with sk-ant-")"
             return "Anthropic didn't accept this key (\(shape)). Check the whole key was copied."
         } catch {
             return "Couldn't reach Anthropic (\(error.localizedDescription))."

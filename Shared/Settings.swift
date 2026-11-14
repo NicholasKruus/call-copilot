@@ -33,11 +33,15 @@ struct Settings: Codable {
     /// Sites a web-enabled watcher may open pages on. Each entry covers the site and its subdomains; "gov.uk" covers
     /// every UK government site. Searching isn't limited by this list; opening pages is.
     var trustedSites: [String]?
+    /// iPhone only (the Mac uses your Claude plan): stop listening once a session's estimated cost reaches this many
+    /// US dollars. Default 10.
+    var sessionBudget: Double?
 
     var activeWatchers: [Watcher] { (watchers ?? []).filter(\.isOn) }
     var usesWeb: Bool { activeWatchers.contains(where: \.usesWeb) }
     var modelName: String { model ?? "claude-opus-5-5" }
     var effortLevel: String { effort ?? "low" }
+    var budget: Double { max(sessionBudget ?? 10, 0.5) }
 
     /// Loads the settings, creating the file from the bundled defaults the first time. A file that can't be read
     /// runs no watchers (asks only), never the defaults, so a typo can't switch on watchers or web access the user
@@ -88,15 +92,37 @@ struct Settings: Codable {
         }.joined(separator: "\n")
     }
 
-    /// Trusted sites as bare host names ("https://www.pewresearch.org/x" becomes "www.pewresearch.org").
-    var trustedHosts: [String] {
+    /// Trusted sites as bare host names ("https://www.pewresearch.org/x" becomes "www.pewresearch.org"; a path is
+    /// dropped, so an entry covers the whole site). Entries that would trust far more than one site, or that aren't a
+    /// plain host name, are left out: see `rejectedSites`.
+    var trustedHosts: [String] { (trustedSites ?? []).compactMap { Self.host(fromSite: $0) }.filter { Self.problem(with: $0) == nil } }
+
+    /// Entries left out of the trusted list, with the reason, for a note when listening starts.
+    var rejectedSites: [String] {
         (trustedSites ?? []).compactMap { site in
-            var s = site.trimmingCharacters(in: .whitespaces).lowercased()
-            if let r = s.range(of: "://") { s = String(s[r.upperBound...]) }
-            s = String(s.prefix { $0 != "/" && $0 != "?" && $0 != "#" })
-            s = s.trimmingCharacters(in: CharacterSet(charactersIn: ".*"))
-            return s.isEmpty ? nil : s
+            guard let h = Self.host(fromSite: site) else { return nil }
+            return Self.problem(with: h).map { "“\(site)” (\($0))" }
         }
+    }
+
+    private static func host(fromSite site: String) -> String? {
+        var s = site.trimmingCharacters(in: .whitespaces).lowercased()
+        if let r = s.range(of: "://") { s = String(s[r.upperBound...]) }
+        s = String(s.prefix { $0 != "/" && $0 != "?" && $0 != "#" })
+        s = s.trimmingCharacters(in: CharacterSet(charactersIn: ".*"))
+        return s.isEmpty ? nil : s
+    }
+
+    /// Endings anyone can register a site under. "gov", "gov.uk" and similar are fine: only governments get those.
+    static let tooBroad: Set<String> = ["com", "org", "net", "info", "biz", "io", "co", "ai", "app", "dev", "me", "xyz",
+                                        "edu", "uk", "co.uk", "org.uk", "ac.uk", "us", "eu", "de", "fr", "ca", "au",
+                                        "com.au", "github.io", "substack.com", "medium.com", "blogspot.com"]
+
+    private static func problem(with host: String) -> String? {
+        if !host.allSatisfy({ $0.isASCII }) || host.contains("xn--") { return "not a plain ASCII name" }
+        if host.contains("@") || host.contains(":") || host.contains(" ") { return "not a plain site name" }
+        if tooBroad.contains(host) { return "too broad: it covers sites anyone can publish" }
+        return nil
     }
 
     /// --allowedTools entries for opening pages: each trusted site and its subdomains (a bare entry doesn't cover www).
@@ -164,6 +190,7 @@ struct Reference {
             }
         }
         if text.count > maxChars { text = String(text.prefix(maxChars)) + "\n(cut off at \(maxChars) characters)" }
+        text = PromptText.neutral(text)
         var links = Set(Self.urls(in: text)) // only addresses Claude was actually shown
         items.values.compactMap(\.url).forEach { links.insert($0) }
         return (Reference(watcher: watcher.name, source: source, text: text, items: items, links: links), note)
@@ -192,10 +219,16 @@ struct Reference {
         } catch {
             // Labelled, not silent: an older copy is used and the panel says so.
             if let d = try? Data(contentsOf: cached), let age {
-                return (d, "couldn't refresh (\(error)); using the copy from \(Int(age / 3600)) h ago")
+                return (d, "couldn't refresh (\(Self.describe(error))); using the copy from \(Int(age / 3600)) h ago")
             }
-            throw error
+            throw CaptureError(Self.describe(error))
         }
+    }
+
+    /// An error without the address it came from (a reference list's address can contain a private token).
+    private static func describe(_ error: Error) -> String {
+        if let e = error as? URLError { return "network error \(e.code.rawValue)" }
+        return "\(error)"
     }
 
     static func urls(in text: String) -> [String] {
