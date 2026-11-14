@@ -102,10 +102,9 @@ struct Settings: Codable {
     /// --allowedTools entries for opening pages: each trusted site and its subdomains (a bare entry doesn't cover www).
     var fetchRules: [String] { trustedHosts.flatMap { ["WebFetch(domain:\($0))", "WebFetch(domain:*.\($0))"] } }
 
-    /// The Messages API's allowed_domains for opening pages (each covers its subdomains). The API takes only full site
-    /// names, so an entry without a dot, such as "gov", can't be passed on: see `sitesTheAPIRejects`.
-    var fetchDomains: [String] { trustedHosts.filter { $0.contains(".") } }
-    var sitesTheAPIRejects: [String] { trustedHosts.filter { !$0.contains(".") } }
+    /// The Messages API's allowed_domains for opening pages. Each covers its subdomains, so "gov" covers every .gov
+    /// site (the API accepts it; checked 14 Nov 2026).
+    var fetchDomains: [String] { trustedHosts }
 
     func isTrusted(_ url: URL) -> Bool {
         guard let host = url.host?.lowercased() else { return false }

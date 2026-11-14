@@ -1,9 +1,9 @@
 # Call Copilot
 
-A Mac menu-bar app that listens to your calls and shows, in a small floating panel, the kinds of information you
-asked for, as the conversation gives a reason. You set it up with **watchers**: plain-language instructions such as
-"when anyone states or speculates about an empirical question, surface the best evidence, or say there isn't any".
-You can also type a question about the call at any time.
+A Mac menu-bar app that listens to your calls and shows, in a small floating panel, the kinds of information you asked
+for, as the conversation gives a reason. An [iPhone version](#iphone) does the same for in-person meetings. You set it
+up with **watchers**: plain-language instructions such as "when anyone states or speculates about an empirical
+question, surface the best evidence, or say there isn't any". You can also type a question about the call at any time.
 
 **Demo (90 s):** https://drive.google.com/file/d/1zYHBsufWiXJaaGe-Kde--JpB7vsw0Ot0/view
 
@@ -91,6 +91,45 @@ work) and the panel says what's wrong; curly quotes from a text editor are fine.
 - `enabled: false` turns a watcher off without deleting it. `aboutMe` is optional context.
 - `model` and `effort` are passed to Claude Code. A smaller model uses less of your plan.
 
+## iPhone
+
+The iPhone app listens through the phone's microphone, so it hears everyone in a room, or a call playing on a nearby
+speaker. It can't hear a call taken on the iPhone itself: iOS doesn't let one app hear another app's call audio.
+
+- **Same watchers and settings** as the Mac app, edited in the app's Settings screen.
+- **Your own Anthropic API key**, not your Claude plan: Anthropic doesn't allow other apps to use a Claude
+  subscription login, and Claude Code doesn't run on iPhone. Create a key at
+  [platform.claude.com](https://platform.claude.com/settings/keys) and paste it into Settings. It's kept in the
+  iPhone's Keychain (this device only) and is checked with Anthropic before it's saved. You pay per use; the running
+  cost shows while you listen.
+- **Start it** with **Listen**, or say "Start Call Copilot" to Siri, or assign the "Start listening" shortcut to the
+  Action Button. It keeps listening with the screen locked. The newest card shows on the Lock Screen and in the Dynamic
+  Island, with a **Stop** button. It stops by itself after 10 minutes without speech, or after 4 hours.
+- **Web access** uses Anthropic's own web search and page fetch. Pages open only on your trusted sites (the API
+  enforces the list, subdomains included), and only at addresses already in the conversation, so Claude can't make one
+  up. There's no other tool: it can't run, change or send anything.
+- **Privacy:** audio stays on the phone. The transcript, your questions, your settings and your reference lists go to
+  Anthropic under your API account's data settings. Nothing from a meeting is saved after listening stops. Cards on
+  the Lock Screen can be read by anyone who sees your phone.
+
+### Install on your iPhone
+
+You need a Mac with Xcode 26 or later, and an iPhone on iOS 26 or later.
+
+1. Clone the repo and open `CallCopilot.xcodeproj` in Xcode. Sign in under Xcode → Settings → Accounts (a free Apple
+   account works; the app then needs reinstalling every 7 days).
+2. Create `iOS/Config/Signing.local.xcconfig` with your team ID and a unique bundle ID prefix (see
+   `iOS/Config/Signing.xcconfig`), or pick your team under each target's Signing & Capabilities.
+3. Connect the iPhone by cable, tap **Trust**, then turn on **Settings → Privacy & Security → Developer Mode**. (The
+   switch appears only once Xcode has connected to the phone. Network filters such as VPN split tunnelling or a
+   corporate socket filter can stop that connection; turn them off while installing.)
+4. Run `iOS/build.sh phone` (or press Run in Xcode). On the iPhone, trust your developer account under
+   **Settings → General → VPN & Device Management**, open Call Copilot and add your API key.
+
+**Cost** on the iPhone, measured with the two example watchers on Opus 5.5 at low effort: the first update of a session
+about $0.10 (it caches the Automations list), an update that searched the web about $0.07, and other updates about a
+cent. Sonnet and Haiku cost less.
+
 ## How it works
 
 1. **Call detection** (`CallDetector.swift`): every 2 s, macOS's audio process list shows which call apps are using
@@ -122,8 +161,9 @@ work) and the panel says what's wrong; curly quotes from a text editor are fine.
   speaker or web page would have to talk Claude into it, and the site would have to be one you trust, which is why the
   default list has research publishers, statistics offices and government sites, but not places anyone can publish,
   such as university home pages. Turn `web` off on all watchers if that matters for your calls.
-- **Links can't be planted.** A card links only to an address from a reference list, from a search result's list of
-  links, or to a trusted page Claude actually opened; not to anything typed into a search, a page's text or an error.
+- **Links come from sources, not from Claude.** A card links only to an address from a reference list, from a search
+  result, or to a trusted page Claude actually opened; never to an address Claude wrote, a page's text or an error. A
+  search can return any site, so the card shows each link's site name: check it before relying on it.
 - **Only Anthropic's Claude Code runs.** Anything the app launches inherits its microphone and system-audio access, so
   it checks that `claude` is signed by Anthropic before starting it. The app uses Apple's hardened runtime, so other
   code can't load into it.
@@ -151,6 +191,11 @@ Checks that need no microphone (each needs its `--test-*` argument):
     "build.noindex/Call Copilot.app/Contents/MacOS/CallCopilot" --test-preview dark
     # The demo: two audio tracks played through the real pipeline at real-time pace, with a captions window
     "build.noindex/Call Copilot.app/Contents/MacOS/CallCopilot" --test-demo me.wav them.wav --ask-at 68 "Which is the quickest win?"
+
+The code both apps share (settings, card and link rules, the prompt, transcription) is in `Shared/`. The iPhone app is
+in `iOS/`; `iOS/Harness/run.sh --selftest` checks its card and link rules on a Mac, and `iOS/build.sh sim` runs it in the
+Simulator. On the iPhone, `--test-file <audio in the app's Documents>` and `--test-listen` (passed with
+`xcrun devicectl device process launch … --console`) print the cards.
 
 ## License
 

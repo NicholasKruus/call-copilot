@@ -1,2 +1,7 @@
 build.noindex/
 .DS_Store
+
+# iPhone app: personal signing settings, and Xcode user state
+iOS/Config/Signing.local.xcconfig
+xcuserdata/
+*.xcuserstate
